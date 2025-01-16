@@ -1,159 +1,179 @@
+import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
+###############################################################################
+# (A) UTILITIES FOR ALLUVIAL PLOT
+###############################################################################
 def sigmoid(x):
+    """Sigmoid function used for smoothing ribbon curves."""
     return 1 / (1 + np.exp(-x))
 
 def calc_sigmoid_line(width, y_start, y_end):
+    """
+    Returns arrays (xs, ys_under) that define the "lower boundary" of a sigmoid
+    curve going from (x=0, y=y_start) to (x=width, y=y_end).
+    """
     xs = np.linspace(-5, 5, num=50)
-    ys = np.array([sigmoid(x) for x in xs])
-    xs = xs / 10 + 0.5 # これで0~1の範囲になる
+    ys = sigmoid(xs)
+    xs = xs / 10 + 0.5  # rescale into [0..1]
     xs *= width
     ys = y_start + (y_end - y_start) * ys
     return xs, ys
 
-def plot(df, xaxis_names, y_name, alluvium, order_dict=None, ignore_continuity=False, cmap_name='tab10', figsize=(6.4, 4.8)):
-    '''
-    Plot alluvial plot
+###############################################################################
+# (B) MAIN PLOT FUNCTION
+###############################################################################
+def plot(
+    df, 
+    xaxis_names,        # e.g. ["behavior", "baseline_bin", "day7_bin", "day30_bin"]
+    y_name,             # numeric column for flow size, e.g. "freq"
+    alluvium=None,      # column to color by, e.g. "behavior" or "sign"
+    order_dict=None,    # dict specifying the order for each pillar (if desired)
+    ignore_continuity=False,
+    cmap_name='tab10',
+    figsize=(6.4, 4.8)
+):
+    """
+    Plots an alluvial diagram with multiple pillars (given by xaxis_names).
     
     Parameters
-    --------
-    df: pandas DataFrame
-        df must be in wide format, as shown in the example below.
-        Example)
-        |    |   survived | class   | sex    |   freq |
-        |---:|-----------:|:--------|:-------|-------:|
-        |  0 |          0 | First   | female |      3 |
-        |  1 |          0 | First   | male   |     77 |
-        |  2 |          0 | Second  | female |      6 |
-        |  3 |          0 | Second  | male   |     91 |
-        |  4 |          0 | Third   | female |     72 |
-    xaxis_names: list of str
-        Specify the column names to line up on the x-axis. It is drawn in the order of this list.
-        Example) ['class', 'sex']
-    y_name: str
-        Specify a column name that represents the height of the y-axis.
-        Example) 'freq'
-    alluvium: str or None
-        Specify the column name of the alluvial color. 
-        If ignore_continuity is true and you want to reset the colors in each Stratum, set it to None.
-        Example) 'survived'
-    order_dict: dict
-        If you want to adjust the order in each Stratum, specify the order like the following example.
-        Example) {'class': ['Third', 'Second', 'First'], 'sex': ['male', 'female']}
-    ignore_continuity: bool
-        Specify True if you want to ignore the continuity of each axis, otherwise False.
-        Example) True
-    cmap_name: str
-        Specify any matplotlib's colormap name you want to use in the following link.
-        It is recommended to choose from the Qualitative colormaps.
-        ref) https://matplotlib.org/examples/color/colormaps_reference.html
-        Example) 'tab10'
-    figsize: tuple of float
-        Specify the figsize.
-        Example) (10, 10)
-        
-    Return
-    --------
-    fig: matplotlib figure object
-    '''
+    ----------
+    df : pd.DataFrame
+        Must have:
+        - One column per "pillar" in xaxis_names (categorical or string)
+        - A numeric column y_name for flow size
+        - (Optional) 'alluvium' column to color flows
+    xaxis_names : list of str
+        The pillar columns in the order you want them displayed
+    y_name : str
+        Numeric column name for flow height/width
+    alluvium : str or None
+        If not None, each unique value in this column is assigned a unique color
+    order_dict : dict or None
+        If provided, you can specify an order for each pillar. 
+        Example: {"baseline_bin": ["3-4","4-5","5-6",...]}
+    ignore_continuity : bool
+        If True, it draws each pair of pillars separately (not recommended).
+        If False, it tries to draw them in one pass, connecting the pillars.
+    cmap_name : str
+        A matplotlib colormap name, e.g. "tab10"
+    figsize : tuple
+        Size of the figure
+
+    Returns
+    -------
+    fig : matplotlib Figure
+    """
     df = df.copy()
-        
-    # 各stratumの高さを計算する
+    
+    # 1) Build stratum sums for each pillar
     stratum_dict = {}
     for xaxis in xaxis_names:
-        stratum_dict[xaxis] = df.groupby(xaxis)[y_name].sum()
+        # groupby that axis, sum up the numeric y_name
+        # observed=False -> includes all categories that appear in data
+        stratum_dict[xaxis] = df.groupby(xaxis, observed=False)[y_name].sum()
     
-    # stratumの順番を設定する
-    if order_dict is None:
-        pass
-    else:
+    # 2) If we have an order_dict, reorder existing categories (but don't force new)
+    if order_dict:
         for key, orders in order_dict.items():
-            stratum = stratum_dict[key]
-            stratum_dict[key] = stratum[orders]
+            if key in stratum_dict:
+                # restrict to the intersection so we skip categories not in the data
+                existing = stratum_dict[key].index.intersection(orders)
+                stratum_dict[key] = stratum_dict[key].loc[existing]
 
+    # 3) Draw the stacked bars for each pillar
     fig, ax = plt.subplots(figsize=figsize)
     
-    # plot stratum (stacked bar)
-    for i, stratum in enumerate(stratum_dict.values()):
-        xtick_label = stratum.index.name
-        names = stratum.index.values
-        values = stratum.values
-
-        for j, (name, value) in enumerate(zip(names, values)):
-            bottom = values[:j - len(stratum)].sum()
-            rectangle = ax.bar(
-                x=[i],
-                height=value,
-                bottom=bottom,
+    for i, (xaxis, stratum_series) in enumerate(stratum_dict.items()):
+        # remove zero-usage categories so we don't label them
+        stratum_series = stratum_series[stratum_series > 0]
+        
+        names = stratum_series.index
+        values = stratum_series.values
+        
+        bottom_accum = 0
+        for name, val in zip(names, values):
+            ax.bar(
+                x=i,
+                height=val,
+                bottom=bottom_accum,
+                width=0.4,
                 color='white',
                 edgecolor='black',
-                fill=True,
-                linewidth=1,
-                width=0.4
+                linewidth=1
             )
-            text_y = rectangle[0].get_height() / 2 + bottom
-            ax.text(x=i, y=text_y, s=name, horizontalalignment='center', verticalalignment='center')
-    
-    cmap = plt.get_cmap(cmap_name)
+            # Only label if >0
+            label_y = bottom_accum + val / 2
+            ax.text(
+                i, label_y, str(name),
+                ha='center', va='center', fontsize=8
+            )
+            bottom_accum += val
 
-    # alluviumのcolor dictを作成する
-    if alluvium is not None:
-        color_val = df[alluvium].unique()
-        color_dict = dict(zip(color_val, list(range(len(color_val)))))
-    
-    if ignore_continuity:
-        for i in range(len(xaxis_names)):
-            if i + 1 >= len(xaxis_names):
-                break
-            else:
-                if alluvium is None:
-                    alluvium = xaxis_names[i]
-                    color_val = df[alluvium].unique()
-                    color_dict = dict(zip(color_val, list(range(len(color_val)))))
-                
-                agg_cols = list(set([f'{alluvium}'] + xaxis_names[i: i+2]))
-                df_agg = df.groupby(agg_cols, as_index=False)[y_name].sum()
-                _plot_alluvium(df_agg, xaxis_names[i: i+2], y_name, alluvium, order_dict, color_dict, ax, cmap, i)
-                alluvium = None
+    # 4) Build color mapping if we have an alluvium
+    import matplotlib
+    cmap = matplotlib.cm.get_cmap(cmap_name)
+    if alluvium:
+        unique_vals = df[alluvium].unique()
+        color_dict = {val: idx for idx, val in enumerate(unique_vals)}
     else:
-        _plot_alluvium(df, xaxis_names, y_name, alluvium, order_dict, color_dict, ax, cmap, 0)
-                
-    # set xticklabels
-    ax.set_xticks(list(range(len(stratum_dict))))
-    ax.set_xticklabels([stratum.index.name for stratum in stratum_dict.values()])
-    
+        color_dict = {}
+
+    # 5) Draw the flows
+    if ignore_continuity:
+        # Draw each pair of pillars separately
+        for i in range(len(xaxis_names) - 1):
+            left_col = xaxis_names[i]
+            right_col = xaxis_names[i+1]
+            agg_cols = [c for c in [alluvium, left_col, right_col] if c is not None]
+            df_agg = df.groupby(agg_cols, observed=False, as_index=False)[y_name].sum()
+            _plot_alluvium(df_agg, [left_col, right_col], y_name, alluvium, color_dict, cmap, ax, x_init=i)
+    else:
+        # Connect all pillars in one pass
+        _plot_alluvium(df, xaxis_names, y_name, alluvium, color_dict, cmap, ax, x_init=0)
+
+    ax.set_xticks(range(len(xaxis_names)))
+    ax.set_xticklabels(xaxis_names)
+    ax.set_xlim(-0.5, len(xaxis_names)-0.5)
+    plt.tight_layout()
     return fig
 
-def _plot_alluvium(df, xaxis_names, y_name, alluvium, order_dict, color_dict, ax, cmap, x_init=0):
-    # 任意のalluviumの順番を設定する
-    if order_dict is None:
-        pass
-    else:
-        for key, orders in order_dict.items():
-            if key in df.columns:
-                df[f'{key}_order'] = df[key].map(dict(zip(orders, list(range(len(orders)))))).astype(int)
-    # alluviumの高さを計算する
+###############################################################################
+# (C) HELPER FOR DRAWING THE FLOWS
+###############################################################################
+def _plot_alluvium(df, xaxis_names, y_name, alluvium, color_dict, cmap, ax, x_init=0):
+    """
+    Internal helper that draws the sigmoid "flows" between consecutive pillars.
+    We filter out zero usage if needed.
+    """
+    df = df.copy()
+    
+    # 1) Sort each pillar to build cumulative sums
     for xaxis in xaxis_names:
-        if xaxis + '_order' in df.columns:
-            df = df.sort_values(xaxis + '_order')
-        else:
-            df = df.sort_values(xaxis)
-        df[f'y_{xaxis}'] = df[y_name].cumsum().shift(1).fillna(0)
-
-    # plot alluvium
-    for i in range(len(xaxis_names)):
-        if i + 1 >= len(xaxis_names):
-            break
-        else:
-            for y_left, y_right, height, color_key in zip(
-                df[f'y_{xaxis_names[i]}'].values,
-                df[f'y_{xaxis_names[i + 1]}'].values,
-                df[y_name].values,
-                df[alluvium].values):
-
-                xs, ys_under = calc_sigmoid_line(0.6, y_left, y_right)
-                xs += i + 0.2
-                ys_upper = ys_under + height
-
-                ax.fill_between(xs + x_init, ys_under, ys_upper, alpha=0.7, color=cmap(color_dict.get(color_key)))
+        df = df.sort_values(xaxis)
+        # cumulative sum for each pillar
+        df["y_" + xaxis] = df[y_name].cumsum().shift(1).fillna(0)
+    
+    # 2) Actually draw flows
+    for i in range(len(xaxis_names) - 1):
+        left_col = xaxis_names[i]
+        right_col = xaxis_names[i+1]
+        for _, row in df.iterrows():
+            y_left = row["y_" + left_col]
+            y_right = row["y_" + right_col]
+            height = row[y_name]
+            
+            # skip 0 usage
+            if height <= 0:
+                continue
+            
+            color_key = row[alluvium] if alluvium else None
+            
+            xs, ys_under = calc_sigmoid_line(0.6, y_left, y_right)
+            xs += i + 0.2
+            ys_upper = ys_under + height
+            
+            # if color_key is absent from color_dict, use gray
+            color = cmap(color_dict[color_key]) if (color_key in color_dict) else 'gray'
+            ax.fill_between(xs + x_init, ys_under, ys_upper, color=color, alpha=0.7)
